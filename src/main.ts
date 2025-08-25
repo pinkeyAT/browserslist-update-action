@@ -1,8 +1,6 @@
 import * as core from '@actions/core';
 import { exec } from '@actions/exec';
 import * as github from '@actions/github';
-import { GitHub, getOctokitOptions } from '@actions/github/lib/utils';
-import { paginateGraphql } from '@octokit/plugin-paginate-graphql';
 import { print } from 'graphql/language/printer';
 import { detect, resolveCommand } from 'package-manager-detector';
 import { join as path } from 'path';
@@ -48,8 +46,7 @@ const labels = (core.getInput('labels') || '')
   .map((label) => label.trim())
   .filter((label) => !!label);
 
-const MyOctokit = GitHub.plugin(paginateGraphql);
-const octokit = new MyOctokit(getOctokitOptions(githubToken));
+const octokit = github.getOctokit(githubToken);
 
 async function run(): Promise<void> {
   try {
@@ -143,11 +140,18 @@ async function run(): Promise<void> {
       .trim()
       .split('\n')
       .map((line) => line.trim().split(' ').slice(1).join(' '));
-    const lockfile = {
+    const lockfileMap = {
       npm: 'package-lock.json',
       yarn: 'yarn.lock',
+      'yarn@berry': 'yarn.lock',
       pnpm: 'pnpm-lock.yaml',
-    }[pkgMgr.agent];
+      'pnpm@6': 'pnpm-lock.yaml',
+      'pnpm@7': 'pnpm-lock.yaml',
+      'pnpm@8': 'pnpm-lock.yaml',
+      bun: 'bun.lockb',
+      deno: 'deno.lock',
+    };
+    const lockfile = lockfileMap[pkgMgr.agent as keyof typeof lockfileMap];
     const filesToCommit = changedFiles.filter(
       (file) => file === 'package.json' || (lockfile && file === lockfile) || file === '.browserslistrc',
     );
@@ -224,12 +228,25 @@ async function run(): Promise<void> {
       owner: repositoryOwner,
       name: repositoryName,
     };
+    const labelsNodes: ({ id: string; name: string } | null)[] = [];
+    let labelsCursor: string | undefined | null = null;
+    let labelsHasNextPage = true;
+    while (labelsHasNextPage) {
+      const result: LabelsQuery = await octokit.graphql({
+        query: print(Labels),
+        ...labelsQueryData,
+        cursor: labelsCursor,
+      });
+      (result.repository?.labels?.nodes ?? []).forEach((node) => labelsNodes.push(node));
+      labelsHasNextPage = result.repository?.labels?.pageInfo.hasNextPage ?? false;
+      labelsCursor = result.repository?.labels?.pageInfo.endCursor;
+    }
     const labelIds =
-      (await octokit.graphql.paginate<LabelsQuery>(print(Labels), labelsQueryData)).repository?.labels?.nodes
+      labelsNodes
         // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
-        ?.filter((node) => labels.includes(node?.name!))
+        ?.filter((node: { name: string } | null) => labels.includes(node?.name!))
         // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
-        .map((node) => node?.id!) ?? [];
+        .map((node: { id: string } | null) => node?.id!) ?? [];
     if (labelIds.length) {
       const addLabelsMutationData: AddLabelsMutationVariables = {
         input: {
@@ -249,7 +266,7 @@ async function run(): Promise<void> {
         // try to replace reviewer login by its corresponding ID. Otherwise, consider we already deal with the ID
         const userQueryData: UserQueryVariables = { login: reviewer };
         return octokit.graphql<UserQuery>({ query: print(User), ...userQueryData }).then(
-          (response) => response?.user?.id ?? reviewer,
+          (response: UserQuery) => response?.user?.id ?? reviewer,
           () => reviewer,
         );
       }),
@@ -262,11 +279,22 @@ async function run(): Promise<void> {
     if (teamReviewers.length) {
       try {
         const organizationQueryData: OrganizationQueryVariables = { login: repositoryOwner };
+        const teamsNodes: ({ name?: string; id?: string } | null)[] = [];
+        let teamsCursor: string | undefined | null = null;
+        let teamsHasNextPage = true;
+        while (teamsHasNextPage) {
+          const result: OrganizationQuery = await octokit.graphql({
+            query: print(Organization),
+            ...organizationQueryData,
+            cursor: teamsCursor,
+          });
+          (result.organization?.teams?.nodes ?? []).forEach((node) => teamsNodes.push(node));
+          teamsHasNextPage = result.organization?.teams?.pageInfo.hasNextPage ?? false;
+          teamsCursor = result.organization?.teams?.pageInfo.endCursor;
+        }
+
         const teams = new Map(
-          (
-            (await octokit.graphql.paginate<OrganizationQuery>(print(Organization), organizationQueryData))
-              ?.organization?.teams?.nodes ?? []
-          ).map((team) => [team?.name, team?.id]),
+          (teamsNodes ?? []).map((team: { name?: string; id?: string } | null) => [team?.name, team?.id]),
         );
         teamReviewers = teamReviewers.map((team) => teams.get(team) ?? team);
       } catch {
